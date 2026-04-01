@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ppisp"
-version = "1.0.1"
+version = "1.1.0"
 description = "CUDA extension for PPISP"
 requires-python = ">=3.10"
 dependencies = ["torch", "matplotlib", "numpy"]

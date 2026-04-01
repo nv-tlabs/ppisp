@@ -200,7 +200,7 @@ class _PPISPFunction(torch.autograd.Function):
         color_params: torch.Tensor,
         crf_params: torch.Tensor,
         rgb_in: torch.Tensor,
-        pixel_coords: torch.Tensor,
+        pixel_coords: torch.Tensor | None,
         resolution_w: int,
         resolution_h: int,
         camera_idx: int,
@@ -277,7 +277,7 @@ def ppisp_apply(
     color_params: torch.Tensor,
     crf_params: torch.Tensor,
     rgb_in: torch.Tensor,
-    pixel_coords: torch.Tensor,
+    pixel_coords: torch.Tensor | None,
     resolution_w: int,
     resolution_h: int,
     camera_idx: torch.Tensor | int | None = None,
@@ -294,15 +294,15 @@ def ppisp_apply(
         vignetting_params: Per-camera vignetting [num_cameras, 3, 5]
         color_params: Per-frame color correction [num_frames, 8]
         crf_params: Per-camera CRF [num_cameras, 3, 4]
-        rgb_in: Input RGB [..., 3]
-        pixel_coords: Pixel coordinates [..., 2]
+        rgb_in: Input RGB [H, W, 3] or [N, 3]
+        pixel_coords: Pixel coordinates [H, W, 2], [N, 2], or None.
         resolution_w: Image width
         resolution_h: Image height
         camera_idx: Camera index (Tensor, int, or None). None disables per-camera effects.
         frame_idx: Frame index (Tensor, int, or None). None disables per-frame effects.
 
     Returns:
-        Processed RGB [..., 3] - same shape as rgb_in
+        Processed RGB [H, W, 3] or [N, 3] - same shape as rgb_in
     """
     # Normalize indices: Tensor/int/None -> int (-1 for None)
     camera_idx = _normalize_index(camera_idx, "camera_idx")
@@ -311,17 +311,24 @@ def ppisp_apply(
     # Store original shape for restoring output
     original_shape = rgb_in.shape
 
-    # Flatten to [N, 3] and [N, 2] for processing
+    # Flatten tensors for processing and assert correct dimensions
     rgb_flat = rgb_in.view(-1, rgb_in.shape[-1])
-    coords_flat = pixel_coords.view(-1, pixel_coords.shape[-1])
-
-    # Assertions on flattened tensors
     assert rgb_flat.shape[-1] == 3, f"Expected 3 RGB channels, got {rgb_flat.shape[-1]}"
-    assert coords_flat.shape[-1] == 2, f"Expected 2D coords, got {coords_flat.shape[-1]}"
-    assert rgb_flat.shape[0] == coords_flat.shape[0], (
-        f"rgb and pixel_coords must have same num_pixels after flattening, "
-        f"got {rgb_flat.shape[0]} vs {coords_flat.shape[0]}"
-    )
+    if pixel_coords is None:
+        coords_flat = None
+        assert rgb_flat.shape[0] == resolution_w * resolution_h, (
+            f"resolution must be consistent with num_pixels in rgb, "
+            f"{resolution_w * resolution_h} vs {rgb_flat.shape[0]}"
+        )
+    else:
+        coords_flat = pixel_coords.view(-1, pixel_coords.shape[-1])
+        assert coords_flat.shape[-1] == 2, (
+            f"Expected 2D coords, got {coords_flat.shape[-1]}"
+        )
+        assert rgb_flat.shape[0] == coords_flat.shape[0], (
+            f"rgb and pixel_coords must have same num_pixels after flattening, "
+            f"got {rgb_flat.shape[0]} vs {coords_flat.shape[0]}"
+        )
 
     # Convert to float32 and ensure contiguous memory layout
     exposure_params = exposure_params.float().contiguous()
@@ -329,7 +336,8 @@ def ppisp_apply(
     color_params = color_params.float().contiguous()
     crf_params = crf_params.float().contiguous()
     rgb_flat = rgb_flat.float().contiguous()
-    coords_flat = coords_flat.float().contiguous()
+    if coords_flat is not None:
+        coords_flat = coords_flat.float().contiguous()
 
     rgb_out = _PPISPFunction.apply(
         exposure_params,
@@ -579,8 +587,8 @@ class PPISP(nn.Module):
     def forward(
         self,
         rgb: torch.Tensor,
-        pixel_coords: torch.Tensor,
-        resolution: tuple[int, int],
+        pixel_coords: torch.Tensor | None = None,
+        resolution: tuple[int, int] | None = None,
         camera_idx: torch.Tensor | int | None = None,
         frame_idx: torch.Tensor | int | None = None,
         exposure_prior: torch.Tensor | None = None,
@@ -592,17 +600,30 @@ class PPISP(nn.Module):
         dimension of pixel_coords must be 2 (x, y).
 
         Args:
-            rgb: Input RGB [..., 3]
-            pixel_coords: Pixel coordinates [..., 2]
-            resolution: Image resolution as (width, height)
+            rgb: Input RGB [H, W, 3] or [N, 3]
+            pixel_coords: Pixel coordinates [H, W, 2] or [N, 2]. Uses pixel centers when None.
+            resolution: Image resolution as (width, height). Inferred from rgb when None.
             camera_idx: Camera index (Tensor, int, or None). None disables per-camera effects.
             frame_idx: Frame index (Tensor, int, or None). None disables per-frame effects.
             exposure_prior: Prior exposure value [1] (defaults to zero if not provided)
 
         Returns:
-            Processed RGB [..., 3] - same shape as rgb
+            Processed RGB [H, W, 3] or [N, 3] - same shape as rgb
         """
-        resolution_w, resolution_h = resolution
+        if resolution is None or pixel_coords is None:
+            assert rgb.dim() == 3, (
+                f"resolution and pixel_coords can only be inferred from [H, W, 3] input (got shape {rgb.shape})"
+            )
+
+        if resolution is None:
+            resolution_w, resolution_h = rgb.shape[1], rgb.shape[0]
+        else:
+            resolution_w, resolution_h = resolution
+            if pixel_coords is None:
+                assert resolution_w == rgb.shape[1] and resolution_h == rgb.shape[0], (
+                    f"Explicit resolution ({resolution_w}x{resolution_h}) must match "
+                    f"rgb shape ({rgb.shape[1]}x{rgb.shape[0]}) when pixel_coords is None"
+                )
 
         # Normalize indices: Tensor/int/None -> int (-1 for None)
         camera_idx_int = _normalize_index(camera_idx, "camera_idx")
