@@ -18,7 +18,6 @@
 #ifndef _PPISP_BINDINGS_H_INC
 #define _PPISP_BINDINGS_H_INC
 
-#include <pybind11/optional.h>
 #include <torch/extension.h>
 
 // =============================================================================
