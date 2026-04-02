@@ -18,11 +18,73 @@ Setup script for ppisp CUDA extension.
 Based on https://github.com/rahul-goel/fused-ssim/blob/main/setup.py
 """
 
-from setuptools import setup
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
-import torch
-import sys
 import os
+import re
+import sys
+
+from setuptools import setup
+
+
+def get_project_metadata():
+    """
+    Extract name/version from pyproject.toml to prevent older setuptools or
+    non-isolated builds from falling back to UNKNOWN.
+
+    - Python >= 3.11: Prefer the stdlib TOML parser (tomllib)
+    - Python 3.10: Fall back to minimal regex parsing (only [project] name/version)
+    """
+    project_file = os.path.join(os.path.dirname(__file__), "pyproject.toml")
+    if not os.path.exists(project_file):
+        raise FileNotFoundError("pyproject.toml not found")
+
+    with open(project_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Prefer stdlib TOML parser when available.
+    try:
+        import tomllib  # Python 3.11+
+    except Exception:  # pragma: no cover
+        tomllib = None
+
+    if tomllib is not None:
+        data = tomllib.loads(content)
+        project = data.get("project", {}) if isinstance(data, dict) else {}
+        name = project.get("name")
+        version = project.get("version")
+        if isinstance(name, str) and isinstance(version, str) and name and version:
+            return {"name": name, "version": version}
+
+    # Minimal regex fallback (compatible with Python 3.10, no third-party deps).
+    project_section_match = re.search(
+        r"(?ms)^\[project\]\s*$\n(.*?)(?:^\[.*?\]\s*$|\Z)", content
+    )
+    project_section = project_section_match.group(1) if project_section_match else content
+    name_match = re.search(
+        r'(?m)^\s*name\s*=\s*["\']([^"\']+)["\']\s*$', project_section
+    )
+    version_match = re.search(
+        r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']\s*$', project_section
+    )
+
+    name = name_match.group(1) if name_match else None
+    version = version_match.group(1) if version_match else None
+    if not name or not version:
+        raise RuntimeError("Could not extract project name/version from pyproject.toml")
+
+    return {"name": name, "version": version}
+
+
+metadata = get_project_metadata()
+
+
+# Optional: fail fast with a clear error message when building from source without PyTorch installed.
+try:
+    import torch
+    from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+except ImportError:
+    print("Error: PyTorch must be installed before installing/building this package.")
+    print("Try running: pip install torch")
+    raise
 
 # Force unbuffered output
 os.environ['PYTHONUNBUFFERED'] = '1'
@@ -117,6 +179,9 @@ class CustomBuildExtension(BuildExtension):
 
 
 setup(
+    name=metadata["name"],
+    version=metadata["version"],
+    packages=["ppisp"],
     ext_modules=[
         CUDAExtension(
             name="ppisp_cuda",
