@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ppisp"
-version = "1.1.1"
+dynamic = ["version"]
 description = "CUDA extension for PPISP"
 requires-python = ">=3.10"
 dependencies = ["torch", "matplotlib", "numpy"]
@@ -13,6 +13,9 @@ readme = "README.md"
 authors = [
     { name = "NVIDIA Corporation" },
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "ppisp._version.__version__"}
 
 [tool.setuptools]
 include-package-data = false

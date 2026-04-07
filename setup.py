@@ -18,11 +18,16 @@ Setup script for ppisp CUDA extension.
 Based on https://github.com/rahul-goel/fused-ssim/blob/main/setup.py
 """
 
-from setuptools import setup
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import torch
-import sys
+from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
+import sys
+
+from setuptools import setup
+
+_v = {}
+exec(open(os.path.join(os.path.dirname(__file__), "ppisp", "_version.py")).read(), _v)
+
 
 # Force unbuffered output
 os.environ['PYTHONUNBUFFERED'] = '1'
@@ -58,8 +63,10 @@ def get_cuda_arch_flags():
                 compute_arch = f"compute_{arch_version}"
                 sm_arch = f"sm_{arch_version}"
             if has_ptx:
-                gencode_flags.append(f"-gencode=arch={compute_arch},code={compute_arch}")
-            gencode_flags.append(f"-gencode=arch={compute_arch},code={sm_arch}")
+                gencode_flags.append(
+                    f"-gencode=arch={compute_arch},code={compute_arch}")
+            gencode_flags.append(
+                f"-gencode=arch={compute_arch},code={sm_arch}")
         if gencode_flags:
             msg = f"Using TORCH_CUDA_ARCH_LIST: {arch_list_env}"
             print(msg)
@@ -117,6 +124,9 @@ class CustomBuildExtension(BuildExtension):
 
 
 setup(
+    name="ppisp",
+    version=_v["__version__"],
+    packages=["ppisp"],
     ext_modules=[
         CUDAExtension(
             name="ppisp_cuda",

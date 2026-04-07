@@ -39,12 +39,7 @@ import ppisp_cuda as _C
 # Version
 # =============================================================================
 
-from importlib.metadata import version, PackageNotFoundError
-
-try:
-    __version__ = version("ppisp")
-except PackageNotFoundError:
-    __version__ = "0.0.0"  # fallback for editable/dev install
+from ppisp._version import __version__
 
 # =============================================================================
 # Constants
