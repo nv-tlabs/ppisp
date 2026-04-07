@@ -18,6 +18,9 @@
 #include "bindings.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("ppisp_forward", &ppisp_forward_tensor);
-    m.def("ppisp_backward", &ppisp_backward_tensor);
+    // Use move policy to ensure proper tensor ownership transfer
+    m.def("ppisp_forward", &ppisp_forward_tensor,
+          py::return_value_policy::move);
+    m.def("ppisp_backward", &ppisp_backward_tensor,
+          py::return_value_policy::move);
 }
