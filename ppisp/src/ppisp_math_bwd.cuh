@@ -794,6 +794,11 @@ __device__ __forceinline__ void apply_color_correction_ppisp_bwd(
 // ----------------------------------------------------------------------------
 // CRF - PPISP Backward
 // ----------------------------------------------------------------------------
+// PPISP_CRF_BASE_GRAD_EPS (ppisp_constants.h) is the dead zone at the endpoints
+// of the normalized toe/shoulder inputs. Do not apply it to the intermediate y
+// before gamma: a small y can still yield a well-conditioned composed curve
+// (e.g. toe=5 and gamma=0.2). The forward values are untouched.
+
 __device__ __forceinline__ void apply_crf_ppisp_bwd(const float3 &rgb_in,
                                                     const CRFPPISPChannelParams *crf_params,
                                                     const float3 &grad_rgb_out, float3 &grad_rgb_in,
@@ -818,119 +823,73 @@ __device__ __forceinline__ void apply_crf_ppisp_bwd(const float3 &rgb_in,
         float b = 1.0f - a;
 
         float x = rgb_arr[i];
-        float y;
 
-        if (x <= center) {
-            y = a * __powf(__fdividef(x, center), toe);
+        // Recompute the forward exactly as apply_crf_ppisp does. The power's
+        // value feeds the a/b/toe/shoulder terms; gradients through its base and
+        // exponent are zero inside the PPISP_CRF_BASE_GRAD_EPS dead zone.
+        const bool low = x <= center;
+        float base, powered, y;
+        if (low) {
+            base = __fdividef(x, center);
+            powered = __powf(base, toe);
+            y = a * powered;
         } else {
-            y = 1.0f - b * __powf(__fdividef(1.0f - x, 1.0f - center), shoulder);
+            base = __fdividef(1.0f - x, 1.0f - center);
+            powered = __powf(base, shoulder);
+            y = 1.0f - b * powered;
         }
-
-        float output = __powf(fmaxf(0.0f, y), gamma);
         float y_clamped = fmaxf(0.0f, y);
+        float output = __powf(y_clamped, gamma);
 
-        // Backward through gamma
+        // Backward through gamma: output = y_clamped^gamma. Preserve every
+        // positive y so small intermediate values do not stop shadow gradients.
         float grad_y = 0.0f;
+        float grad_gamma = 0.0f;
         if (y_clamped > 0.0f) {
-            grad_y = grad_out_arr[i] * gamma * __powf(y_clamped, gamma - 1.0f);
+            // y^(gamma-1) = output / y
+            grad_y = grad_out_arr[i] * gamma * output / y_clamped;
+            grad_gamma = grad_out_arr[i] * output * __logf(y_clamped);
         }
 
-        // Backward through piecewise curve
+        // Backward through the piecewise curve to x, center, toe/shoulder, a/b.
         float grad_x = 0.0f;
-        if (x <= center && center > 0.0f) {
-            float base = __fdividef(x, center);
-            if (base > 0.0f) {
-                grad_x = grad_y * a * toe * __powf(base, toe - 1.0f) / center;
+        float grad_toe = 0.0f;
+        float grad_shoulder = 0.0f;
+        float grad_center = 0.0f;
+        float grad_a = 0.0f;
+        float grad_b = 0.0f;
+        const bool base_active = base > PPISP_CRF_BASE_GRAD_EPS;
+
+        if (low && center > 0.0f) {
+            // y = a * base^toe, base = x / center
+            grad_a += grad_y * powered;
+            if (base_active) {
+                grad_toe += grad_y * a * powered * __logf(base);
+                // dy/dbase = a * toe * base^(toe-1) with base^(toe-1) = powered / base;
+                // dbase/dx = 1/center; dbase/dcenter = -x / center^2
+                float grad_base = grad_y * a * toe * powered / base;
+                grad_x = grad_base / center;
+                grad_center += grad_base * (-x / (center * center));
             }
-        } else if (x > center && center < 1.0f) {
-            float base = __fdividef(1.0f - x, 1.0f - center);
-            if (base > 0.0f) {
-                grad_x = grad_y * b * shoulder * __powf(base, shoulder - 1.0f) / (1.0f - center);
+        } else if (!low && center < 1.0f) {
+            // y = 1 - b * base^shoulder, base = (1 - x) / (1 - center)
+            grad_b += -grad_y * powered;
+            if (base_active) {
+                grad_shoulder += -grad_y * b * powered * __logf(base);
+                // dy/dbase = -b * shoulder * base^(shoulder-1) with base^(shoulder-1) =
+                // powered / base; dbase/dx = -1/(1-center); dbase/dcenter = (1-x) / (1-center)^2
+                float grad_base = grad_y * (-b * shoulder * powered / base);
+                grad_x = -grad_base / (1.0f - center);
+                grad_center += grad_base * ((1.0f - x) / ((1.0f - center) * (1.0f - center)));
             }
         }
 
         grad_in_arr[i] = grad_x;
 
-        // Parameter gradients through transformations
-        // We need to compute: grad_raw_param = grad_transformed_param *
-        // d_transformed/d_raw
-
-        // First, compute gradients to the transformed parameters (toe, shoulder,
-        // gamma, center)
-        float grad_toe = 0.0f;
-        float grad_shoulder = 0.0f;
-        float grad_gamma = 0.0f;
-        float grad_center = 0.0f;
-
-        // Gradient to gamma from output = pow(y_clamped, gamma)
-        if (y_clamped > 0.0f) {
-            grad_gamma = grad_out_arr[i] * output * __logf(y_clamped + 1e-8f);
-        }
-
-        // Gradients to toe, shoulder, center through the piecewise curve
-        // These are complex, so we'll compute them numerically stable
-
-        // For toe and shoulder, they affect the curve through a, b, and the power
-        // terms For center, it affects both the conditional and the curve shape
-
-        // Gradient to 'a' and 'b' from the curve
-        float grad_a = 0.0f;
-        float grad_b = 0.0f;
-
-        if (x <= center && center > 0.0f) {
-            // y = a * (x/center)^toe
-            float base = __fdividef(x, center);
-            if (base > 0.0f) {
-                float powered = __powf(base, toe);
-                grad_a += grad_y * powered;
-
-                // grad_toe from the power term
-                grad_toe += grad_y * a * powered * __logf(base + 1e-8f);
-
-                // grad_center from the base (x/center)
-                // dy/dcenter = dy/dbase * dbase/dcenter
-                // dy/dbase = grad_y * a * toe * base^(toe-1)
-                // dbase/dcenter = d(x/center)/dcenter = -x / center^2
-                float grad_base = grad_y * a * toe * __powf(base, toe - 1.0f);
-                grad_center += grad_base * (-x / (center * center));
-            }
-        } else if (x > center && center < 1.0f) {
-            // y = 1 - b * ((1-x)/(1-center))^shoulder
-            float base = __fdividef(1.0f - x, 1.0f - center);
-            if (base > 0.0f) {
-                float powered = __powf(base, shoulder);
-                grad_b += -grad_y * powered;
-
-                // grad_shoulder from the power term
-                grad_shoulder += -grad_y * b * powered * __logf(base + 1e-8f);
-
-                // grad_center from the base ((1-x)/(1-center))
-                // dy/dcenter = dy/dbase * dbase/dcenter
-                // dy/dbase = grad_y * (-b * shoulder * base^(shoulder-1))
-                // dbase/dcenter = d((1-x)/(1-center))/dcenter = (1-x) / (1-center)^2
-                float grad_base = grad_y * (-b * shoulder * __powf(base, shoulder - 1.0f));
-                float dbase_dcenter = (1.0f - x) / ((1.0f - center) * (1.0f - center));
-                grad_center += grad_base * dbase_dcenter;
-            }
-        }
-
-        // Gradient to toe, shoulder through a and b
-        // a = (shoulder * center) / lerp_val, where lerp_val = (shoulder - toe) *
-        // center + toe b = 1 - a
-
-        // NOTE: In Slang, the computation is structured as:
-        //   1. Vectorially compute: float3 a = (shoulders * centers) / ((shoulders - toes) * centers + toes)
-        //   2. Per-channel loop: float c = centers[i]; ... use c in divisions
-        // The key is that 'centers' is used in BOTH places, but Slang's autodiff
-        // only computes gradients through the VECTORIAL use (#1), not through
-        // the per-channel extraction (#2).
-        //
-        // In CUDA, we're computing everything per-channel, so we need to ensure
-        // gradients ONLY flow through the 'a' and 'b' computation, NOT through
-        // the per-channel divisions (x/c, (1-x)/(1-c)) which we already removed.
-
-        // CRITICAL: Since b = 1 - a, we have db/da = -1
-        // So grad_a needs to accumulate -grad_b BEFORE we use it
+        // Gradient to toe, shoulder, and center through a and b, on top of the
+        // center gradient through the normalized base accumulated above:
+        // a = (shoulder * center) / lerp_val, lerp_val = (shoulder - toe) * center + toe,
+        // b = 1 - a so db/da = -1 and grad_a must absorb -grad_b before use.
         grad_a += -grad_b;
 
         float grad_lerp_val = 0.0f;

@@ -22,4 +22,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ppisp_backward", &ppisp_backward_tensor);
     m.def("ppisp_regularization_forward", &ppisp_regularization_forward_tensor);
     m.def("ppisp_regularization_backward", &ppisp_regularization_backward_tensor);
+    m.def("set_validate_inputs", [](bool enabled) { ppisp_validate_inputs().store(enabled); });
+    m.def("validate_inputs_enabled", [] { return ppisp_validate_inputs().load(); });
+    // The PyTorch reference in tests mirrors this dead zone; the tests assert equality.
+    m.attr("CRF_BASE_GRAD_EPS") = PPISP_CRF_BASE_GRAD_EPS;
 }

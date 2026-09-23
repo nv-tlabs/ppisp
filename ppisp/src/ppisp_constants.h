@@ -22,3 +22,9 @@ constexpr int PPISP_COLOR_PARAMS = 8;
 constexpr int PPISP_FRAME_MEAN_SUMS_SIZE = 1 + PPISP_COLOR_PARAMS;
 constexpr int PPISP_CRF_PARAMS_PER_CHANNEL = 4;
 constexpr int PPISP_VIGNETTING_PARAMS_PER_CHANNEL = 5;
+
+// Dead zone at the endpoints of the normalized CRF toe/shoulder inputs: the
+// backward zeroes the gradients through the power's base and exponent when the
+// base is at or below this value. Exposed to Python as
+// ppisp_cuda.CRF_BASE_GRAD_EPS so the test reference can assert it uses the same.
+constexpr float PPISP_CRF_BASE_GRAD_EPS = 1e-6f;

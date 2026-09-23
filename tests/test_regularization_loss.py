@@ -178,7 +178,7 @@ def _assert_loss_and_grads_match(
             grad_cuda = torch.zeros_like(param_cuda)
         if grad_torch is None:
             grad_torch = torch.zeros_like(param_torch)
-        max_diff = (grad_cuda - grad_torch).abs().max().item()
+        max_diff = (grad_cuda - grad_torch).abs().max().item() if grad_cuda.numel() else 0.0
         assert torch.allclose(grad_cuda, grad_torch, atol=grad_atol, rtol=grad_rtol), (
             f"{name} grad max_diff={max_diff}"
         )
@@ -541,14 +541,14 @@ def test_regularization_loss_channel_equal_variance_terms_are_zero():
     )
 
 
-def test_regularization_loss_large_multiblock_reduction_matches_torch_reference():
+def test_regularization_loss_large_grid_stride_reduction_matches_torch_reference():
     module_cuda = _make_module(seed=123, num_cameras=19, num_frames=513)
     module_torch = _make_module(seed=124, num_cameras=19, num_frames=513)
     _clone_params(module_cuda, module_torch)
 
-    # The CUDA path uses cross-block atomicAdd reductions. The exact summation
-    # order is not guaranteed, so this intentionally uses looser tolerances
-    # than the small single-block-style cases above.
+    # The CUDA path grid-strides over the inputs and reduces with warp shuffles,
+    # so the summation order differs from the PyTorch reference. This
+    # intentionally uses looser tolerances than the small cases above.
     _assert_loss_and_grads_match(
         module_cuda,
         module_torch,
@@ -592,12 +592,7 @@ def test_regularization_autograd_accepts_non_contiguous_inputs():
         vignetting,
         color,
         crf,
-        cfg.exposure_mean,
-        cfg.vig_center,
-        cfg.vig_channel,
-        cfg.vig_non_pos,
-        cfg.color_mean,
-        cfg.crf_channel,
+        _weights(cfg),
     )
     loss_torch = _regularization_loss_torch_from_tensors(
         exposure,
@@ -614,6 +609,29 @@ def test_regularization_autograd_accepts_non_contiguous_inputs():
     for base in (exposure_base, vignetting_base, color_base, crf_base):
         assert base.grad is not None
         assert torch.isfinite(base.grad).all()
+
+
+def test_as_float_contiguous_returns_ready_inputs_unchanged():
+    ready = torch.zeros(4, 3, device="cuda")
+    assert ppisp._as_float_contiguous(ready) is ready
+
+    strided = torch.zeros(4, 6, device="cuda")[:, ::2]
+    converted = ppisp._as_float_contiguous(strided)
+    assert converted is not strided
+    assert converted.is_contiguous() and converted.dtype is torch.float32
+    assert torch.equal(converted, strided)
+
+    double = torch.ones(4, 3, device="cuda", dtype=torch.float64)
+    converted = ppisp._as_float_contiguous(double)
+    assert converted.dtype is torch.float32
+    assert torch.equal(converted, double.float())
+
+
+def test_regularization_accepts_integer_weights():
+    cfg = _make_config(exposure_mean=1, vig_center=0, vig_channel=0, vig_non_pos=0, color_mean=0, crf_channel=0)
+    module = _make_module(seed=77, config=cfg)
+    loss = module.get_regularization_loss()
+    torch.testing.assert_close(loss, _regularization_loss_torch(module), atol=1e-6, rtol=1e-5)
 
 
 def test_regularization_color_pinv_blocks_are_symmetric():
@@ -661,3 +679,75 @@ def test_regularization_loss_tiny_finite_difference_gradients():
         finite_diff = _central_difference(module, name, index)
         analytic = getattr(module, name).grad[index].item()
         assert analytic == pytest.approx(finite_diff, abs=5e-3, rel=5e-2)
+
+
+def test_regularization_obeys_non_default_stream():
+    module = _make_module(seed=701, num_cameras=8, num_frames=257)
+    reference = _make_module(seed=702, num_cameras=8, num_frames=257)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Keep the producer pending so a default-stream launch cannot pass by luck.
+        torch.cuda._sleep(2_000_000)
+        with torch.no_grad():
+            module.exposure_params.add_(0.13)
+            module.color_params.add_(0.02)
+        loss = module.get_regularization_loss()
+        (loss * 3.25).backward()
+        observed = loss.clone()
+        observed_grads = [p.grad.clone() for p in module.parameters()]
+    stream.synchronize()
+    _clone_params(module, reference)
+    expected = _regularization_loss_torch(reference)
+    (expected * 3.25).backward()
+    torch.testing.assert_close(observed, expected, atol=2e-5, rtol=1e-5)
+    for actual, parameter in zip(observed_grads, reference.parameters()):
+        torch.testing.assert_close(actual, parameter.grad, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("mask", range(64))
+@pytest.mark.parametrize("disabled_weight", [0.0, -0.5])
+def test_regularization_forward_weight_combinations(mask, disabled_weight):
+    names = ("exposure_mean", "vig_center", "vig_channel", "vig_non_pos", "color_mean", "crf_channel")
+    cfg = _make_config(**{name: 0.7 if mask & (1 << i) else disabled_weight for i, name in enumerate(names)})
+    module = _make_module(seed=901, num_cameras=32, num_frames=513, config=cfg)
+    loss, stats = ppisp_cuda.ppisp_regularization_forward(
+        module.exposure_params, module.vignetting_params, module.color_params,
+        module.crf_params, *_weights(cfg),
+    )
+    expected = _regularization_loss_torch(module)
+    torch.testing.assert_close(loss, expected, atol=2e-5, rtol=1e-5)
+    expected_stats = torch.zeros_like(stats)
+    if cfg.exposure_mean > 0:
+        expected_stats[0] = module.exposure_params.sum()
+    if cfg.color_mean > 0:
+        expected_stats[1:] = (module.color_params @ module.color_pinv_block_diag).sum(dim=0)
+    torch.testing.assert_close(stats, expected_stats, atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("frames,cameras", [(0, 0), (0, 8), (257, 0), (255, 8), (256, 8), (257, 8)])
+def test_regularization_empty_and_boundary(frames, cameras):
+    """Forward and backward with empty or block-boundary frame and camera counts.
+
+    The fused kernels replaced the old per-group early returns with a shared
+    work bound and an inv_frames guard, so the backward runs here as well.
+    """
+    module = _make_module(seed=911, num_cameras=cameras, num_frames=frames)
+    cfg = module.config
+    if frames == 0:
+        cfg = replace(cfg, exposure_mean=0.0, color_mean=0.0)
+    if cameras == 0:
+        cfg = replace(cfg, vig_center=0.0, vig_channel=0.0, vig_non_pos=0.0, crf_channel=0.0)
+    if frames == 0 and cameras == 0:
+        # No parameter has elements, so the reference loss is a constant without
+        # a graph; check the CUDA path alone.
+        loss = module.get_regularization_loss()
+        assert loss.item() == 0.0
+        loss.backward()
+        for parameter in module.parameters():
+            assert parameter.grad is not None and parameter.grad.numel() == 0
+        return
+    reference = _make_module(seed=911, num_cameras=cameras, num_frames=frames, config=cfg)
+    _assert_loss_and_grads_match(module, reference, loss_atol=2e-5, grad_atol=1e-5, grad_rtol=1e-4)
+    for parameter in module.parameters():
+        assert torch.isfinite(parameter.grad).all()

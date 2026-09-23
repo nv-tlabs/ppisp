@@ -77,7 +77,7 @@ class PPISPAutograd(torch.autograd.Function):
 
         ctx.save_for_backward(
             exposure_params, vignetting_params,
-            color_params, crf_params, rgb_in, rgb_out, pixel_coords
+            color_params, crf_params, rgb_in, pixel_coords
         )
         ctx.resolution_w = resolution_w
         ctx.resolution_h = resolution_h
@@ -89,7 +89,7 @@ class PPISPAutograd(torch.autograd.Function):
     @staticmethod
     def backward(ctx, v_rgb_out):
         (exposure_params, vignetting_params,
-         color_params, crf_params, rgb_in, rgb_out, pixel_coords) = ctx.saved_tensors
+         color_params, crf_params, rgb_in, pixel_coords) = ctx.saved_tensors
 
         (v_exposure_params, v_vignetting_params,
          v_color_params, v_crf_params, v_rgb_in) = ppisp_cuda.ppisp_backward(
@@ -98,7 +98,6 @@ class PPISPAutograd(torch.autograd.Function):
             color_params,
             crf_params,
             rgb_in,
-            rgb_out,
             pixel_coords,
             v_rgb_out.contiguous(),
             ctx.resolution_w,

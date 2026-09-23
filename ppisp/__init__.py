@@ -59,6 +59,21 @@ _COLOR_PINV_BLOCK_DIAG = torch.block_diag(
 NUM_VIGNETTING_ALPHA_TERMS = 3
 
 
+def set_validate_inputs(enabled: bool) -> None:
+    """Enable or disable input validation in the CUDA extension wrappers.
+
+    Off by default. When enabled, every extension call checks device, dtype,
+    shape, contiguity, and camera/frame indices and raises on malformed inputs,
+    which otherwise reach the kernels unchecked. Useful when debugging.
+    """
+    _C.set_validate_inputs(enabled)
+
+
+def validate_inputs_enabled() -> bool:
+    """Return whether the CUDA extension wrappers validate their inputs."""
+    return _C.validate_inputs_enabled()
+
+
 def _normalize_index(idx: torch.Tensor | int | None, name: str) -> int:
     """Normalize camera/frame index to int.
 
@@ -200,23 +215,23 @@ class _PPISPFunction(torch.autograd.Function):
         camera_idx: int,
         frame_idx: int,
     ) -> torch.Tensor:
-        with torch.cuda.device(rgb_in.device):
-            rgb_out = _C.ppisp_forward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                rgb_in,
-                pixel_coords,
-                resolution_w,
-                resolution_h,
-                camera_idx,
-                frame_idx,
-            )
+        rgb_out = _C.ppisp_forward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            rgb_in,
+            pixel_coords,
+            resolution_w,
+            resolution_h,
+            camera_idx,
+            frame_idx,
+        )
 
+        # The backward recomputes the pipeline from rgb_in, so rgb_out is not saved.
         ctx.save_for_backward(
             exposure_params, vignetting_params,
-            color_params, crf_params, rgb_in, rgb_out, pixel_coords
+            color_params, crf_params, rgb_in, pixel_coords
         )
         ctx.resolution_w = resolution_w
         ctx.resolution_h = resolution_h
@@ -228,24 +243,22 @@ class _PPISPFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, v_rgb_out: torch.Tensor):
         (exposure_params, vignetting_params,
-         color_params, crf_params, rgb_in, rgb_out, pixel_coords) = ctx.saved_tensors
+         color_params, crf_params, rgb_in, pixel_coords) = ctx.saved_tensors
 
-        with torch.cuda.device(rgb_in.device):
-            (v_exposure_params, v_vignetting_params,
-             v_color_params, v_crf_params, v_rgb_in) = _C.ppisp_backward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                rgb_in,
-                rgb_out,
-                pixel_coords,
-                v_rgb_out.contiguous(),
-                ctx.resolution_w,
-                ctx.resolution_h,
-                ctx.camera_idx,
-                ctx.frame_idx,
-            )
+        (v_exposure_params, v_vignetting_params,
+         v_color_params, v_crf_params, v_rgb_in) = _C.ppisp_backward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            rgb_in,
+            pixel_coords,
+            v_rgb_out.contiguous(),
+            ctx.resolution_w,
+            ctx.resolution_h,
+            ctx.camera_idx,
+            ctx.frame_idx,
+        )
 
         return (
             v_exposure_params,
@@ -261,8 +274,39 @@ class _PPISPFunction(torch.autograd.Function):
         )
 
 
+def _as_float_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    """Return ``tensor`` unchanged when it is already float32 and contiguous.
+
+    The dtype and layout checks are plain attribute reads; ``.float()`` and
+    ``.contiguous()`` each go through the dispatcher even when they return the
+    input, and the PPISP parameters are float32 and contiguous by construction.
+    """
+    if tensor.dtype is torch.float32 and tensor.is_contiguous():
+        return tensor
+    return tensor.float().contiguous()
+
+
+def _as_float2_aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """``_as_float_contiguous`` plus the 8-byte alignment of the kernels' float2 loads.
+
+    The extension also copies a misaligned view, but only for its own call;
+    copying here once lets the forward, the backward and the saved tensor share
+    the aligned copy.
+    """
+    tensor = _as_float_contiguous(tensor)
+    if tensor.data_ptr() % 8 != 0:
+        return tensor.clone()
+    return tensor
+
+
 class _PPISPRegularizationFunction(torch.autograd.Function):
-    """Custom autograd function for the PPISP regularization loss."""
+    """Custom autograd function for the PPISP regularization loss.
+
+    ``weights`` is one tuple of six floats in the order
+    ``(exposure_mean, vig_center, vig_channel, vig_non_pos, color_mean,
+    crf_channel)`` so the autograd machinery handles five arguments instead
+    of ten every step.
+    """
 
     @staticmethod
     def forward(
@@ -271,35 +315,20 @@ class _PPISPRegularizationFunction(torch.autograd.Function):
         vignetting_params: torch.Tensor,
         color_params: torch.Tensor,
         crf_params: torch.Tensor,
-        exposure_mean_weight: float,
-        vig_center_weight: float,
-        vig_channel_weight: float,
-        vig_non_pos_weight: float,
-        color_mean_weight: float,
-        crf_channel_weight: float,
+        weights: tuple[float, float, float, float, float, float],
     ) -> torch.Tensor:
-        exposure_params = exposure_params.float().contiguous()
-        vignetting_params = vignetting_params.float().contiguous()
-        color_params = color_params.float().contiguous()
-        crf_params = crf_params.float().contiguous()
+        exposure_params = _as_float_contiguous(exposure_params)
+        vignetting_params = _as_float_contiguous(vignetting_params)
+        color_params = _as_float_contiguous(color_params)
+        crf_params = _as_float_contiguous(crf_params)
 
-        weights = (
-            float(exposure_mean_weight),
-            float(vig_center_weight),
-            float(vig_channel_weight),
-            float(vig_non_pos_weight),
-            float(color_mean_weight),
-            float(crf_channel_weight),
+        loss, frame_mean_sums = _C.ppisp_regularization_forward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            *weights,
         )
-
-        with torch.cuda.device(exposure_params.device):
-            loss, frame_mean_sums = _C.ppisp_regularization_forward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                *weights,
-            )
 
         ctx.save_for_backward(
             exposure_params, vignetting_params, color_params, crf_params, frame_mean_sums
@@ -313,18 +342,18 @@ class _PPISPRegularizationFunction(torch.autograd.Function):
             ctx.saved_tensors
         )
 
-        with torch.cuda.device(exposure_params.device):
-            grads = _C.ppisp_regularization_backward(
-                exposure_params,
-                vignetting_params,
-                color_params,
-                crf_params,
-                v_loss.contiguous(),
-                frame_mean_sums,
-                *ctx.weights,
-            )
+        # The wrapper makes v_loss contiguous; a 0-d tensor already is.
+        grads = _C.ppisp_regularization_backward(
+            exposure_params,
+            vignetting_params,
+            color_params,
+            crf_params,
+            v_loss,
+            frame_mean_sums,
+            *ctx.weights,
+        )
 
-        return grads + (None,) * 6
+        return grads + (None,)
 
 
 # =============================================================================
@@ -355,7 +384,9 @@ def ppisp_apply(
         color_params: Per-frame color correction [num_frames, 8]
         crf_params: Per-camera CRF [num_cameras, 3, 4]
         rgb_in: Input RGB [H, W, 3] or [N, 3]
-        pixel_coords: Pixel coordinates [H, W, 2], [N, 2], or None.
+        pixel_coords: Pixel coordinates [H, W, 2], [N, 2], or None. Ignored when
+            camera_idx is None. When None with a camera, pixel centers are derived
+            from the resolution.
         resolution_w: Image width
         resolution_h: Image height
         camera_idx: Camera index (Tensor, int, or None). None disables per-camera effects.
@@ -374,7 +405,11 @@ def ppisp_apply(
     # Flatten tensors for processing and assert correct dimensions
     rgb_flat = rgb_in.view(-1, rgb_in.shape[-1])
     assert rgb_flat.shape[-1] == 3, f"Expected 3 RGB channels, got {rgb_flat.shape[-1]}"
-    if pixel_coords is None:
+    if camera_idx == -1:
+        # Only the per-camera effects read coordinates; drop them so they are
+        # neither converted nor saved for the backward.
+        coords_flat = None
+    elif pixel_coords is None:
         coords_flat = None
         assert rgb_flat.shape[0] == resolution_w * resolution_h, (
             f"resolution must be consistent with num_pixels in rgb, "
@@ -391,13 +426,13 @@ def ppisp_apply(
         )
 
     # Convert to float32 and ensure contiguous memory layout
-    exposure_params = exposure_params.float().contiguous()
-    vignetting_params = vignetting_params.float().contiguous()
-    color_params = color_params.float().contiguous()
-    crf_params = crf_params.float().contiguous()
-    rgb_flat = rgb_flat.float().contiguous()
+    exposure_params = _as_float_contiguous(exposure_params)
+    vignetting_params = _as_float_contiguous(vignetting_params)
+    color_params = _as_float2_aligned(color_params)
+    crf_params = _as_float_contiguous(crf_params)
+    rgb_flat = _as_float_contiguous(rgb_flat)
     if coords_flat is not None:
-        coords_flat = coords_flat.float().contiguous()
+        coords_flat = _as_float2_aligned(coords_flat)
 
     rgb_out = _PPISPFunction.apply(
         exposure_params,
@@ -794,12 +829,14 @@ class PPISP(nn.Module):
             self.vignetting_params,
             self.color_params,
             self.crf_params,
-            cfg.exposure_mean,
-            cfg.vig_center,
-            cfg.vig_channel,
-            cfg.vig_non_pos,
-            cfg.color_mean,
-            cfg.crf_channel,
+            (
+                cfg.exposure_mean,
+                cfg.vig_center,
+                cfg.vig_channel,
+                cfg.vig_non_pos,
+                cfg.color_mean,
+                cfg.crf_channel,
+            ),
         )
 
     def create_optimizers(self) -> list[torch.optim.Optimizer]:

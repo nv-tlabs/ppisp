@@ -38,6 +38,38 @@ _COLOR_PINV_BLOCK_DIAG = torch.block_diag(
 ).to(torch.float32)
 
 
+class _PowDeadZone(torch.autograd.Function):
+    """``base ** exponent`` whose gradients are zero for ``base <= EPS``.
+
+    Used only for the normalized toe/shoulder bases, matching the CUDA CRF
+    backward. The exact forward keeps black and saturation unchanged while
+    cutting off the singular slope at the endpoints. Gamma must retain its
+    gradients for every positive intermediate value.
+    """
+
+    # PPISP_CRF_BASE_GRAD_EPS, exported as ppisp_cuda.CRF_BASE_GRAD_EPS and
+    # asserted equal by test_reference_dead_zone_matches_cuda_constant.
+    EPS = 1e-6
+
+    @staticmethod
+    def forward(ctx, base: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
+        out = torch.pow(base, exponent)
+        ctx.save_for_backward(base, exponent, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        base, exponent, out = ctx.saved_tensors
+        active = base > _PowDeadZone.EPS
+        # Evaluate the singular factors only where they are used.
+        safe_base = torch.where(active, base, torch.ones_like(base))
+        zero = torch.zeros_like(base)
+        grad_base = torch.where(
+            active, grad_out * exponent * torch.pow(safe_base, exponent - 1.0), zero)
+        grad_exponent = torch.where(active, grad_out * out * torch.log(safe_base), zero)
+        return grad_base, grad_exponent.sum_to_size(exponent.shape)
+
+
 def _get_homography_torch(color_params: torch.Tensor, frame_idx: int) -> torch.Tensor:
     """Compute color correction homography matrix from latent params.
 
@@ -230,18 +262,19 @@ def ppisp_apply_torch(
             x = rgb[:, ch]
             mask_low = x <= center
 
-            # Use eps clamp to avoid NaN gradients from pow(0, fractional)
-            eps = 1e-6
-            y_low = a * torch.pow((x / center).clamp(min=eps), toe)
-            y_high = 1.0 - b * \
-                torch.pow(((1.0 - x) / (1.0 - center)
-                           ).clamp(min=eps), shoulder)
+            # Exact powers with a gradient dead zone next to zero, as in the
+            # CUDA backward (see _PowDeadZone).
+            y_low = a * _PowDeadZone.apply(x / center, toe)
+            y_high = 1.0 - b * _PowDeadZone.apply((1.0 - x) / (1.0 - center), shoulder)
 
             # Select based on mask
             y = torch.where(mask_low, y_low, y_high)
 
-            # Apply gamma
-            rgb_channels.append(torch.pow(y.clamp(min=eps), gamma))
+            # Apply gamma with ordinary autograd for every positive y. Avoid
+            # evaluating the singular power derivative at exactly zero.
+            positive = y > 0.0
+            safe_y = torch.where(positive, y, torch.ones_like(y))
+            rgb_channels.append(torch.where(positive, torch.pow(safe_y, gamma), 0.0))
 
         rgb = torch.stack(rgb_channels, dim=-1)
 
