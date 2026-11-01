@@ -511,15 +511,51 @@ def test_backward_saturated_pixels():
     output_cuda.backward(grad_output)
     output_torch.backward(grad_output)
 
+    # Next to the CRF shoulder the rgb gradient is ill-conditioned: one float32
+    # ulp of input can move the exact gradient by ~0.5, so comparing two float32
+    # results with a fixed bound depends on whether the random sample holds such
+    # a pixel. Judge both against a float64 evaluation of the reference: an
+    # element passes within the 0.5 bound, or when the CUDA result is at most
+    # twice as far from float64 as the float32 reference is at that element.
+    params_64 = {k: v.detach().double().cpu().requires_grad_(True)
+                 for k, v in params_torch.items()}
+    inputs_64 = {k: (v.detach().double().cpu() if torch.is_tensor(v) and v.is_floating_point()
+                     else (v.cpu() if torch.is_tensor(v) else v))
+                 for k, v in inputs.items()}
+    rgb_64 = inputs_64['rgb'].clone().requires_grad_(True)
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)  # the reference's torch.tensor(...) constants
+    try:
+        run_torch_forward(params_64, inputs_64, rgb_64).backward(grad_output.double().cpu())
+    finally:
+        torch.set_default_dtype(default_dtype)
+    g_cuda = rgb_cuda.grad.double().cpu()
+    g_torch = rgb_torch.grad.double().cpu()
+    g_exact = rgb_64.grad
+
     # No pixel may receive a wildly different gradient.
-    max_pixel_diff = (rgb_cuda.grad - rgb_torch.grad).abs().max().item()
-    assert max_pixel_diff <= 0.5, f"rgb_in grad max pixel diff={max_pixel_diff:.2e}"
+    pixel_diff = (g_cuda - g_torch).abs()
+    err_cuda, err_torch = (g_cuda - g_exact).abs(), (g_torch - g_exact).abs()
+    bad = (pixel_diff > 0.5) & (err_cuda > 2 * err_torch)
+    worst = int(torch.argmax(torch.where(bad, err_cuda, torch.zeros_like(err_cuda))))
+    assert not bad.any(), (
+        f"{int(bad.sum())} rgb_in grad elements differ by > 0.5 and are more than twice as far "
+        f"from float64 as the torch reference: worst cuda {err_cuda.flatten()[worst]:.2e}, "
+        f"torch {err_torch.flatten()[worst]:.2e}")
+
+    # The same for the norm-relative error.
+    exact_norm = torch.norm(g_exact).item()
+    rel_diff = torch.norm(g_cuda - g_torch).item() / torch.norm(g_torch).item()
+    rel_cuda = torch.norm(g_cuda - g_exact).item() / exact_norm
+    rel_torch = torch.norm(g_torch - g_exact).item() / exact_norm
+    assert rel_diff <= 1e-3 or rel_cuda <= 2 * rel_torch, (
+        f"rgb_in grad: rel_error={rel_diff:.2e}; from float64: "
+        f"cuda {rel_cuda:.2e}, torch {rel_torch:.2e}")
 
     # Pixels within float error of the clamp remain ill-conditioned, so the
     # parameter sums they dominate get a looser tolerance than the per-pixel
     # rgb gradient.
     grad_pairs = [
-        ('rgb_in', rgb_cuda.grad, rgb_torch.grad, 1e-3),
         ('exposure', params_cuda['exposure_params'].grad,
          params_torch['exposure_params'].grad, 1e-2),
         ('vignetting', params_cuda['vignetting_params'].grad,
