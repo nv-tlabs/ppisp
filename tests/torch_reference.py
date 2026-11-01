@@ -78,7 +78,7 @@ def _get_homography_torch(color_params: torch.Tensor, frame_idx: int) -> torch.T
     cp = color_params[frame_idx]  # [8]
 
     # Map latent -> real offsets via ZCA block-diagonal matrix
-    block_diag = _COLOR_PINV_BLOCK_DIAG.to(cp.device)
+    block_diag = _COLOR_PINV_BLOCK_DIAG.to(cp.device, cp.dtype)
     offsets = cp @ block_diag  # [8]
 
     # Extract real RG offsets for each control chromaticity
